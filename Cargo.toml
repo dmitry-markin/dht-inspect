@@ -1,0 +1,16 @@
+[package]
+name = "dht-inspect"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.81"
+clap = { version = "4.5.3", features = ["derive"] }
+futures = "0.3.27"
+hex = "0.4.3"
+litep2p = { version = "0.9.0", features = ["websocket"] }
+multiaddr = "0.17.0"
+tokio = { version = "1.36.0", features = ["macros"] }
+
+
+
