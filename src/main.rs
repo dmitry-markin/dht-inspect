@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::HashSet, str::FromStr, time::Instant};
 
 use anyhow::{anyhow, Context};
 use clap::Parser;
@@ -10,7 +10,7 @@ use litep2p::{
         RecordKey as KademliaKey,
     },
     transport::{tcp::config::Config as TcpConfig, websocket::config::Config as WsConfig},
-    Litep2p, PeerId,
+    Litep2p, Litep2pEvent, PeerId,
 };
 use multiaddr::{Multiaddr, Protocol};
 
@@ -48,6 +48,9 @@ struct Args {
     /// Kademlia protocol name.
     #[arg(short, long, value_name = "PROTOCOL", default_value = DEFALT_PROTOCOL)]
     kad_proto: String,
+    /// Prepopulate routing table with FIND_NODE queries before executing the main query.
+    #[arg(long, value_name = "ITERATIONS", default_value_t = 0)]
+    prepopulate: usize,
 }
 
 #[tokio::main]
@@ -78,39 +81,89 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("litep2p initialization error")?;
 
-    let query = kademlia_handle
-        .get_providers(args.provider_key.clone())
-        .await;
+    let mut find_node_query = None;
+    let mut get_providers_query = None;
+    let mut iterations = args.prepopulate;
 
-    let mut kademlia_handle = kademlia_handle.fuse();
+    if iterations > 0 {
+        iterations -= 1;
+        println!("Prepopulating Kademlia routing table...");
+        find_node_query = Some(kademlia_handle.find_node(PeerId::random()).await);
+    } else {
+        println!("Running GET_PROVIDERS query...");
+        get_providers_query = Some(
+            kademlia_handle
+                .get_providers(args.provider_key.clone())
+                .await,
+        );
+    }
+
+    let mut discovered_peers = HashSet::new();
+    let mut contacted_peers = HashSet::new();
+    let start = Instant::now();
 
     loop {
         tokio::select! {
-            _event = litep2p.next_event() => {
-                // if let Some(event) = event {
-                //     println!("litep2p event: {event:?}");
-                // } else {
-                //     return Err(anyhow!("litep2p stream ended"))
-                // }
+            event = litep2p.next_event() => match event {
+                Some(Litep2pEvent::ConnectionEstablished { peer, endpoint: _ }) => {
+                    contacted_peers.insert(peer);
+                },
+                _ => {}
             },
-            kademlia_event = kademlia_handle.select_next_some() => {
+            kademlia_event = kademlia_handle.next() => {
+                let Some(kademlia_event) = kademlia_event else {
+                    return Err(anyhow!("libp2p Kademlia terminated"))
+                };
+
                 match kademlia_event {
+                    KademliaEvent::FindNodeSuccess { query_id, .. } if Some(query_id) == find_node_query => {
+                        if iterations > 0 {
+                            iterations -= 1;
+                            find_node_query = Some(kademlia_handle.find_node(PeerId::random()).await);
+                            println!("Prepopulating Kademlia routing table...");
+                        } else {
+                            println!("Running GET_PROVIDERS query...");
+                            get_providers_query = Some(
+                                kademlia_handle
+                                    .get_providers(args.provider_key.clone())
+                                    .await,
+                            );
+                        }
+                    },
                     KademliaEvent::GetProvidersSuccess { query_id, provided_key, providers } => {
-                        if query_id == query && provided_key == args.provider_key {
+                        if Some(query_id) == get_providers_query && provided_key == args.provider_key {
+                            print_statistics(&discovered_peers, &contacted_peers, &start);
                             print_providers(providers);
                             return Ok(())
                         }
                     },
-                    KademliaEvent::QueryFailed { query_id } if query_id == query => {
+                    KademliaEvent::QueryFailed { query_id } if Some(query_id) == find_node_query => {
+                        print_statistics(&discovered_peers, &contacted_peers, &start);
+                        return Err(anyhow!("FIND_NODE query failed"))
+                    },
+                    KademliaEvent::QueryFailed { query_id } if Some(query_id) == get_providers_query => {
+                        print_statistics(&discovered_peers, &contacted_peers, &start);
                         return Err(anyhow!("Kademlia query failed"))
                     },
-                    _event => {
-                        // println!("kademlia event: {event:?}");
+                    KademliaEvent::RoutingTableUpdate { peers } => {
+                        for peer in peers {
+                            discovered_peers.insert(peer);
+                        }
+                    },
+                    event => {
+                        println!("kademlia event: {event:?}");
                     }
                 }
             }
         }
     }
+}
+
+fn print_statistics(discovered: &HashSet<PeerId>, contacted: &HashSet<PeerId>, start: &Instant) {
+    println!("Discovered peers: {:?}", discovered.len());
+    println!("Contacted peers: {:?}", contacted.len());
+    println!("Time spent: {} s", start.elapsed().as_secs());
+    println!("");
 }
 
 fn print_providers(providers: Vec<ContentProvider>) {
